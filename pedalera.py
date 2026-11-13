@@ -459,6 +459,10 @@ class App:
         self.ticks = 0
         self.aviso = ""
         self.error = None
+        self.errores = []
+        self.max_in = 0.0
+        self.aviso_silencio = False
+        self.preferida = None  # (driver, entrada, salida) elegidos cuando hubo que usar otro driver
 
         guardado = self._cargar()
         root.title("Pedalera de guitarra")
@@ -486,8 +490,9 @@ class App:
         return datos.get("audio", {})
 
     def _guardar(self):
+        api, entrada, salida = self.preferida or (self.var_api.get(), self.var_in.get(), self.var_out.get())
         audio = {
-            "api": self.var_api.get(), "entrada": self.var_in.get(), "salida": self.var_out.get(),
+            "api": api, "entrada": entrada, "salida": salida,
             "canal": self.var_canal.get(), "retraso": self.var_retraso.get(), "sr": self.var_sr.get(),
         }
         try:
@@ -560,6 +565,9 @@ class App:
                       "Retraso: si hay cortes, el programa lo sube solo. Estos cambios se aplican al apagar y "
                       "volver a encender.").grid(
             row=2, column=0, columnspan=6, sticky="w", padx=10, pady=(6, 0))
+        tk.Button(self.config, text="📋  Copiar diagnóstico", command=self._copiar_diagnostico, bg="#2f3237",
+                  fg=TEXTO, activebackground="#3a3e44", activeforeground=TEXTO, relief="flat", padx=10, pady=3,
+                  cursor="hand2").grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 0))
 
         self.cb_api.bind("<<ComboboxSelected>>", lambda e: self._listar_dispositivos())
         self.cb_in.bind("<<ComboboxSelected>>", lambda e: self._listar_canales())
@@ -702,6 +710,7 @@ class App:
             self.cortes += 1
         try:
             entrada = indata.astype(np.float64)
+            self.max_in = max(self.max_in, float(np.max(np.abs(entrada))))
             if self.canal_auto and entrada.shape[1] > 1:
                 # si el otro canal tiene claramente más señal, la guitarra está ahí
                 picos = np.max(np.abs(entrada), axis=0)
@@ -722,6 +731,12 @@ class App:
             self._apagar()
         else:
             self.aviso = ""
+            if self.preferida:
+                # la vez anterior hubo que cambiar de driver: volver a intentar con el elegido
+                api, entrada, salida = self.preferida
+                self.preferida = None
+                self.var_api.set(api)
+                self._listar_dispositivos(entrada, salida)
             self._encender()
 
     def _intentos(self):
@@ -793,9 +808,11 @@ class App:
         self.cortes_previos = 0
         self.ticks = 0
         self.error = None
+        self.max_in = 0.0
+        self.aviso_silencio = False
         self.root.configure(cursor="watch")
         self.root.update_idletasks()
-        errores = []
+        errores = self.errores = []
         try:
             for api, disp, ent, sal, sr in self._intentos():
                 try:
@@ -808,10 +825,16 @@ class App:
         if not self.stream:
             self._avisar_falla(errores)
             return
-        if (api, ent, sal) != (self.var_api.get(), self.var_in.get(), self.var_out.get()):
+        elegida = (self.var_api.get(), self.var_in.get(), self.var_out.get())
+        if (api, ent, sal) != elegida:
+            self.preferida = self.preferida or elegida
             self.var_api.set(api)
             self._listar_dispositivos(ent, sal)
-            self.aviso = f"Con la configuración elegida no se pudo abrir la placa; funcionó con el driver {api}."
+            self.aviso = f"No se pudo usar el driver {elegida[0]}; se encendió con {api}."
+            abiertos = programas_de_audio_abiertos()
+            if abiertos:
+                self.aviso += (f" Seguramente {', '.join(abiertos)} está usando la placa: cerralo, "
+                               "apagá y volvé a encender.")
         self.boton.configure(text="■  APAGAR", bg="#c94444", activebackground="#a33636")
         for c in (self.cb_api, self.cb_in, self.cb_out, self.cb_canal):
             c.configure(state="disabled")
@@ -853,7 +876,8 @@ class App:
             self._vigilar_cortes()
         if self.stream:
             ent, sal = self.stream.latency
-            texto = (f"Encendido  ·  {self.stream.samplerate:.0f} Hz  ·  guitarra en canal {self.canal + 1}"
+            texto = (f"Encendido  ·  {self.var_api.get()}  ·  {self.stream.samplerate:.0f} Hz  ·  "
+                     f"guitarra en canal {self.canal + 1}"
                      f"{' (auto)' if self.canal_auto else ''}  ·  "
                      f"retraso ≈ {(ent + sal) * 1000:.1f} ms  ·  CPU {self.stream.cpu_load * 100:.0f}%  ·  "
                      f"cortes: {self.cortes}")
@@ -869,6 +893,11 @@ class App:
     def _vigilar_cortes(self):
         """Cada segundo: si el audio se corta seguido, sube el retraso un escalón y vuelve a encender."""
         self.ticks += 1
+        if self.ticks == 60 and self.max_in < 1e-4:  # 3 s sin nada por encima de -80 dB
+            self._avisar_silencio()
+        elif self.aviso_silencio and self.max_in > 1e-3:  # empezó a llegar la guitarra
+            self.aviso = ""
+            self.aviso_silencio = False
         if self.ticks % 20:
             return
         nuevos = self.cortes - self.cortes_previos
@@ -885,6 +914,51 @@ class App:
         self.var_retraso.set(niveles[actual + 1])
         self._encender()
         self.aviso = f"Había cortes de audio: subí el retraso a «{niveles[actual + 1]}» automáticamente."
+
+    def _avisar_silencio(self):
+        """La placa abrió pero no manda nada: casi siempre otro programa la tiene tomada."""
+        self.aviso_silencio = True
+        abiertos = programas_de_audio_abiertos()
+        if abiertos:
+            self.aviso = (f"La placa no está mandando sonido. Seguramente la está usando: {', '.join(abiertos)}. "
+                          "Cerralo (fijate también al lado del reloj), apagá y volvé a encender.")
+        else:
+            self.aviso = ("La placa no está mandando sonido. Revisá que la guitarra esté en la entrada 1 o 2 con "
+                          "INST apretado. Si sigue igual, desenchufá la placa, volvé a enchufarla y abrí de nuevo "
+                          "la Pedalera.")
+        self.aviso += "\nSi no se soluciona: ⚙ Configuración de audio → Copiar diagnóstico."
+
+    def _diagnostico(self):
+        lineas = [
+            f"Pedalera · Python {sys.version.split()[0]} · sounddevice {sd.__version__} · "
+            f"{sd.get_portaudio_version()[1]}",
+            f"Elegido: {self.var_api.get()} | entrada: {self.var_in.get()} | salida: {self.var_out.get()} | "
+            f"canal: {self.var_canal.get()} | retraso: {self.var_retraso.get()} | Hz: {self.var_sr.get()}",
+        ]
+        if self.preferida:
+            lineas.append(f"Preferido (no abrió): {' | '.join(self.preferida)}")
+        if self.stream:
+            lineas.append(f"Encendido: {self.stream.samplerate:.0f} Hz, retraso {sum(self.stream.latency) * 1000:.1f} ms, "
+                          f"cortes {self.cortes}, canal {self.canal + 1}, "
+                          f"entrada máxima {20 * math.log10(self.max_in + 1e-12):.1f} dBFS")
+        else:
+            lineas.append("Apagado")
+        if self.aviso:
+            lineas.append(f"Aviso: {self.aviso}")
+        if self.errores:
+            lineas.append("Errores al abrir:")
+            lineas += [f"  {e}" for e in self.errores]
+        lineas.append(f"Programas de audio abiertos: {', '.join(programas_de_audio_abiertos()) or 'ninguno'}")
+        lineas.append("Dispositivos:")
+        for i, d in enumerate(sd.query_devices()):
+            lineas.append(f"  {i:>3}  {sd.query_hostapis(d['hostapi'])['name']:<20}  in={d['max_input_channels']} "
+                          f"out={d['max_output_channels']}  {d['default_samplerate']:.0f} Hz  {d['name']}")
+        return "\n".join(lineas)
+
+    def _copiar_diagnostico(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._diagnostico())
+        messagebox.showinfo("Pedalera", "Diagnóstico copiado. Pegalo con Ctrl+V donde te lo pidan.")
 
     def _cerrar(self):
         self._apagar()
