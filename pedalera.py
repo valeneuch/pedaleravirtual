@@ -12,6 +12,9 @@ os.environ.setdefault("SD_ENABLE_ASIO", "1")  # tiene que ir antes de importar s
 
 import json
 import math
+import re
+import subprocess
+import sys
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -21,6 +24,10 @@ import sounddevice as sd
 from scipy import signal
 
 AJUSTES = Path(__file__).with_name("ajustes.json")
+
+# Por defecto Python le deja el control a la interfaz hasta 5 ms seguidos, lo mismo que dura
+# un bloque de audio: el hilo de audio llegaba tarde y el sonido salía entrecortado.
+sys.setswitchinterval(0.0005)
 
 DEFAULTS = {
     "gate.on": True, "gate.umbral": -55.0, "gate.release": 120.0,
@@ -376,6 +383,60 @@ PEDALES = [
 # retraso pedido al driver (s) y tamaño de bloque; con la UMC por ASIO dan ≈10 / 15 / 27 ms
 RETRASOS = {"Mínimo": (0.002, 128), "Bajo": (0.005, 256), "Seguro": (0.010, 512)}
 
+# Programas que suelen quedarse con la placa de audio (comienzo del nombre del .exe, en minúsculas)
+PROGRAMAS_AUDIO = {
+    "fl64": "FL Studio", "fl.exe": "FL Studio", "ableton": "Ableton Live", "reaper": "REAPER",
+    "cubase": "Cubase", "studio one": "Studio One", "bitwig": "Bitwig Studio", "audacity": "Audacity",
+    "guitar rig": "Guitar Rig", "amplitube": "AmpliTube", "bias fx": "BIAS FX", "voicemeeter": "Voicemeeter",
+    "obs64": "OBS Studio", "discord": "Discord", "zoom": "Zoom", "ms-teams": "Microsoft Teams",
+    "teams": "Microsoft Teams", "skype": "Skype", "spotify": "Spotify",
+}
+
+# Palabras que aparecen en nombres de dispositivos de cualquier marca y no sirven para reconocer una placa
+GENERICAS = {"ASIO", "DRIVER", "AUDIO", "USB", "MICRÓFONO", "MICROFONO", "MICROPHONE", "ALTAVOCES",
+             "SPEAKERS", "AURICULARES", "HEADPHONES", "LINE", "DEVICE", "HIGH", "DEFINITION", "INPUT", "OUTPUT", "OUT"}
+
+
+PREFERIDAS_IN = ("UMC ASIO", "IN 1-2 (BEHRINGER", "UMC")
+PREFERIDAS_OUT = ("UMC ASIO", "OUT 1-2 (BEHRINGER", "UMC")
+
+
+def elegir(lista, preferido, palabras):
+    """El preferido si está; si no, el primero que contenga alguna de las palabras, en orden."""
+    if preferido in lista:
+        return preferido
+    for palabra in palabras:
+        for nombre in lista:
+            if palabra in nombre.upper():
+                return nombre
+    return lista[0] if lista else ""
+
+
+def marcas(nombre):
+    """Palabras que identifican a una placa, p. ej. 'UMC ASIO Driver' -> {'UMC'}."""
+    return {w for w in re.findall(r"\w{3,}", nombre.upper()) if w not in GENERICAS and not w.isdigit()}
+
+
+def programas_de_audio_abiertos():
+    script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+              "Get-CimInstance Win32_Process | Select-Object ProcessId, Name, CommandLine | ConvertTo-Json")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        procesos = json.loads(r.stdout.decode("utf-8", errors="replace"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    encontrados = []
+    for proc in procesos:
+        nombre = (proc.get("Name") or "").lower()
+        linea = (proc.get("CommandLine") or "").lower()
+        if "pedalera.py" in linea and nombre.startswith("python") and proc.get("ProcessId") != os.getpid():
+            encontrados.append("Otra ventana de la Pedalera")
+        for inicio, programa in PROGRAMAS_AUDIO.items():
+            if nombre.startswith(inicio):
+                encontrados.append(programa)
+    return sorted(set(encontrados))
+
 FONDO = "#1b1c1f"
 TEXTO = "#e8e8e8"
 GRIS = "#9aa0a6"
@@ -394,6 +455,9 @@ class App:
         self.pico_in = self.pico_out = 0.0
         self.barra_in = self.barra_out = -60.0
         self.cortes = 0
+        self.cortes_previos = 0
+        self.ticks = 0
+        self.aviso = ""
         self.error = None
 
         guardado = self._cargar()
@@ -475,7 +539,7 @@ class App:
         self.var_canal = tk.StringVar(value=guardado.get("canal", "Auto"))
         retraso = guardado.get("retraso")
         self.var_retraso = tk.StringVar(value=retraso if retraso in RETRASOS else "Bajo")
-        self.var_sr = tk.StringVar(value=guardado.get("sr", "48000"))
+        self.var_sr = tk.StringVar(value=guardado.get("sr", "Auto"))
 
         def combo(fila, col, texto, var, ancho, valores=()):
             tk.Label(self.config, text=texto, bg="#232529", fg=TEXTO).grid(row=fila, column=col, sticky="e",
@@ -489,11 +553,12 @@ class App:
         self.cb_out = combo(0, 4, "Salida", self.var_out, 34)
         self.cb_canal = combo(1, 0, "Canal de la guitarra", self.var_canal, 8)
         combo(1, 2, "Retraso", self.var_retraso, 8, tuple(RETRASOS))
-        combo(1, 4, "Frecuencia (Hz)", self.var_sr, 8, ("44100", "48000", "96000"))
+        combo(1, 4, "Frecuencia (Hz)", self.var_sr, 8, ("Auto", "44100", "48000", "96000"))
         tk.Label(self.config, bg="#232529", fg=GRIS, justify="left", anchor="w",
                  text="Recomendado: Driver ASIO + UMC ASIO Driver. Canal en Auto detecta solo dónde está "
-                      "enchufada la guitarra.\nRetraso: probá Mínimo; si escuchás cortes o chasquidos, pasá a "
-                      "Bajo o Seguro. Estos cambios se aplican al apagar y volver a encender.").grid(
+                      "enchufada la guitarra. Frecuencia en Auto usa la que ya tiene configurada la placa.\n"
+                      "Retraso: si hay cortes, el programa lo sube solo. Estos cambios se aplican al apagar y "
+                      "volver a encender.").grid(
             row=2, column=0, columnspan=6, sticky="w", padx=10, pady=(6, 0))
 
         self.cb_api.bind("<<ComboboxSelected>>", lambda e: self._listar_dispositivos())
@@ -512,32 +577,27 @@ class App:
         else:
             self.config.pack(fill="x", padx=16, pady=(0, 6), after=self.ayuda)
 
-    def _listar_dispositivos(self, entrada=None, salida=None):
-        api = self.apis.index(self.var_api.get())
-        ins, outs = [], []
-        self.dispositivos = {}
+    def _dispositivos_de(self, api, entrada=None, salida=None):
+        """Para un driver: {nombre: índice}, entradas, salidas y la entrada/salida más probables."""
+        indice = self.apis.index(api)
+        disp, ins, outs = {}, [], []
         for i, d in enumerate(sd.query_devices()):
-            if d["hostapi"] != api:
+            if d["hostapi"] != indice:
                 continue
-            self.dispositivos[d["name"]] = i
+            disp[d["name"]] = i
             if d["max_input_channels"] > 0:
                 ins.append(d["name"])
             if d["max_output_channels"] > 0:
                 outs.append(d["name"])
+
+        return disp, ins, outs, elegir(ins, entrada, PREFERIDAS_IN), elegir(outs, salida, PREFERIDAS_OUT)
+
+    def _listar_dispositivos(self, entrada=None, salida=None):
+        self.dispositivos, ins, outs, ent, sal = self._dispositivos_de(self.var_api.get(), entrada, salida)
         self.cb_in["values"] = ins
         self.cb_out["values"] = outs
-
-        def elegir(lista, preferido, palabras):
-            if preferido in lista:
-                return preferido
-            for palabra in palabras:
-                for nombre in lista:
-                    if palabra in nombre.upper():
-                        return nombre
-            return lista[0] if lista else ""
-
-        self.var_in.set(elegir(ins, entrada, ("UMC ASIO", "IN 1-2 (BEHRINGER", "UMC")))
-        self.var_out.set(elegir(outs, salida, ("UMC ASIO", "OUT 1-2 (BEHRINGER", "UMC")))
+        self.var_in.set(ent)
+        self.var_out.set(sal)
         self._listar_canales()
 
     def _listar_canales(self):
@@ -561,7 +621,7 @@ class App:
             c = tk.Canvas(fila, height=10, bg="#2a2c30", highlightthickness=0)
             c.pack(side="left", fill="x", expand=True)
             self.lienzos.append(c)
-        self.estado = tk.Label(marco, text="Apagado", bg=FONDO, fg=GRIS, anchor="w")
+        self.estado = tk.Label(marco, text="Apagado", bg=FONDO, fg=GRIS, anchor="w", justify="left")
         self.estado.pack(fill="x", pady=(4, 0))
 
     def _dibujar_barra(self, lienzo, nivel_db):
@@ -661,44 +721,114 @@ class App:
         if self.stream:
             self._apagar()
         else:
+            self.aviso = ""
             self._encender()
 
-    def _encender(self):
-        try:
-            entrada = self.dispositivos[self.var_in.get()]
-            salida = self.dispositivos[self.var_out.get()]
-        except KeyError:
-            messagebox.showerror("Pedalera", "Abrí ⚙ Configuración de audio y elegí una entrada y una salida.")
-            return
-        max_in = sd.query_devices(entrada)["max_input_channels"]
-        self.canal_auto = self.var_canal.get() == "Auto"
+    def _intentos(self):
+        """Lo elegido primero; si falla, otras frecuencias y la misma placa en los otros drivers."""
+        elegida = self.var_sr.get()
+        buscadas = marcas(self.var_in.get()) | marcas(self.var_out.get())
+        apis = [self.var_api.get()] + [a for pref in ("ASIO", "WASAPI", "DirectSound", "MME")
+                                       for a in self.apis if pref in a]
+        vistos = set()
+        for n, api in enumerate(apis):
+            if n == 0:
+                disp, ent, sal = self.dispositivos, self.var_in.get(), self.var_out.get()
+            else:
+                disp, ins, outs, _, _ = self._dispositivos_de(api)
+                # en otro driver solo sirve la misma placa, no el micrófono de la laptop
+                ins = [d for d in ins if marcas(d) & buscadas]
+                outs = [d for d in outs if marcas(d) & buscadas]
+                if not ins or not outs:
+                    continue
+                ent, sal = elegir(ins, None, PREFERIDAS_IN), elegir(outs, None, PREFERIDAS_OUT)
+            if ent not in disp or sal not in disp:
+                continue
+            info_in, info_out = sd.query_devices(disp[ent]), sd.query_devices(disp[sal])
+            frecuencias = [int(elegida)] if elegida != "Auto" and n == 0 else []
+            frecuencias += [int(info_in["default_samplerate"]), int(info_out["default_samplerate"]), 48000, 44100]
+            for sr in frecuencias:
+                if (api, ent, sal, sr) not in vistos:
+                    vistos.add((api, ent, sal, sr))
+                    yield api, disp, ent, sal, sr
+
+    def _abrir(self, api, entrada, salida, sr):
+        info_in, info_out = sd.query_devices(entrada), sd.query_devices(salida)
+        max_in = info_in["max_input_channels"]
         if self.canal_auto:
             self.canal = 0
             n_in = min(2, max_in)
         else:
             self.canal = min(int(self.var_canal.get()), max_in) - 1
             n_in = self.canal + 1
-        n_out = min(2, sd.query_devices(salida)["max_output_channels"])
-        sr = int(self.var_sr.get())
+        n_out = min(2, info_out["max_output_channels"])
         latencia, bloque = RETRASOS[self.var_retraso.get()]
+        extra = None
+        if "ASIO" not in api:
+            # sin ASIO, Windows no llega con retrasos tan chicos y el audio sale entrecortado
+            latencia = max(latencia, info_in["default_low_input_latency"],
+                           info_out["default_low_output_latency"], 0.02)
+        if "WASAPI" in api:
+            ajustes = sd.WasapiSettings(auto_convert=True)  # Windows convierte si la frecuencia no coincide
+            extra = (ajustes, ajustes)
         self.pedalera = Pedalera(sr)
-        self.cortes = 0
-        self.error = None
+        stream = None
         try:
-            self.stream = sd.Stream(device=(entrada, salida), samplerate=sr, blocksize=bloque,
-                                    channels=(n_in, n_out), dtype="float32", latency=latencia,
-                                    callback=self._callback)
-            self.stream.start()
-        except Exception as e:
-            self.stream = None
-            messagebox.showerror("Pedalera", f"No se pudo abrir el audio:\n\n{e}\n\n"
-                                             "Cerrá otros programas que estén usando la placa (FL Studio, "
-                                             "DAWs, etc.) o probá otra Frecuencia o Retraso en "
-                                             "⚙ Configuración de audio.")
+            stream = sd.Stream(device=(entrada, salida), samplerate=sr, blocksize=bloque,
+                               channels=(n_in, n_out), dtype="float32", latency=latencia,
+                               extra_settings=extra, callback=self._callback)
+            stream.start()
+        except Exception:
+            if stream:
+                stream.close()
+            raise
+        return stream
+
+    def _encender(self):
+        if self.var_in.get() not in self.dispositivos or self.var_out.get() not in self.dispositivos:
+            messagebox.showerror("Pedalera", "Abrí ⚙ Configuración de audio y elegí una entrada y una salida.")
             return
+        self.canal_auto = self.var_canal.get() == "Auto"
+        self.cortes = 0
+        self.cortes_previos = 0
+        self.ticks = 0
+        self.error = None
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        errores = []
+        try:
+            for api, disp, ent, sal, sr in self._intentos():
+                try:
+                    self.stream = self._abrir(api, disp[ent], disp[sal], sr)
+                    break
+                except Exception as e:
+                    errores.append(f"{api} · {ent} · {sr} Hz: {e}")
+        finally:
+            self.root.configure(cursor="")
+        if not self.stream:
+            self._avisar_falla(errores)
+            return
+        if (api, ent, sal) != (self.var_api.get(), self.var_in.get(), self.var_out.get()):
+            self.var_api.set(api)
+            self._listar_dispositivos(ent, sal)
+            self.aviso = f"Con la configuración elegida no se pudo abrir la placa; funcionó con el driver {api}."
         self.boton.configure(text="■  APAGAR", bg="#c94444", activebackground="#a33636")
         for c in (self.cb_api, self.cb_in, self.cb_out, self.cb_canal):
             c.configure(state="disabled")
+
+    def _avisar_falla(self, errores):
+        abiertos = programas_de_audio_abiertos()
+        if abiertos:
+            texto = ("Estos programas están abiertos y pueden estar usando la placa:\n\n    • "
+                     + "\n    • ".join(abiertos)
+                     + "\n\nCerralos (fijate también en los íconos al lado del reloj) y volvé a apretar ENCENDER.")
+        else:
+            texto = ("No encontré ningún programa de audio abierto.\n\n"
+                     "Desenchufá la placa del USB, esperá unos segundos, volvé a enchufarla y abrí "
+                     "de nuevo la Pedalera.")
+        if errores:
+            texto += f"\n\nDetalle técnico: {errores[0]}"
+        messagebox.showerror("No se pudo abrir la placa de audio", texto)
 
     def _apagar(self):
         if self.stream:
@@ -720,17 +850,41 @@ class App:
             self._dibujar_barra(lienzo, actual)
 
         if self.stream:
+            self._vigilar_cortes()
+        if self.stream:
             ent, sal = self.stream.latency
-            texto = (f"Encendido  ·  guitarra en canal {self.canal + 1}"
+            texto = (f"Encendido  ·  {self.stream.samplerate:.0f} Hz  ·  guitarra en canal {self.canal + 1}"
                      f"{' (auto)' if self.canal_auto else ''}  ·  "
                      f"retraso ≈ {(ent + sal) * 1000:.1f} ms  ·  CPU {self.stream.cpu_load * 100:.0f}%  ·  "
                      f"cortes: {self.cortes}")
+            if self.aviso:
+                texto += f"\n{self.aviso}"
             if self.error:
-                texto += f"  ·  ERROR: {self.error}"
-            self.estado.configure(text=texto)
+                texto += f"\nERROR: {self.error}"
+            self.estado.configure(text=texto, fg="#e0b848" if self.aviso or self.error else GRIS)
         else:
-            self.estado.configure(text="Apagado  ·  apretá ENCENDER para empezar")
+            self.estado.configure(text="Apagado  ·  apretá ENCENDER para empezar", fg=GRIS)
         self.root.after(50, self._refrescar)
+
+    def _vigilar_cortes(self):
+        """Cada segundo: si el audio se corta seguido, sube el retraso un escalón y vuelve a encender."""
+        self.ticks += 1
+        if self.ticks % 20:
+            return
+        nuevos = self.cortes - self.cortes_previos
+        self.cortes_previos = self.cortes
+        if self.ticks == 20 or nuevos < 3:  # el primer segundo siempre trae algún corte al arrancar
+            return
+        niveles = list(RETRASOS)
+        actual = niveles.index(self.var_retraso.get())
+        if actual == len(niveles) - 1:
+            self.aviso = ("Sigue habiendo cortes. Instalá el driver ASIO de la placa, enchufá la laptop "
+                          "al cargador y conectá la placa directo a la PC (sin hub USB).")
+            return
+        self._apagar()
+        self.var_retraso.set(niveles[actual + 1])
+        self._encender()
+        self.aviso = f"Había cortes de audio: subí el retraso a «{niveles[actual + 1]}» automáticamente."
 
     def _cerrar(self):
         self._apagar()

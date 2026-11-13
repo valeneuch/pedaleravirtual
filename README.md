@@ -69,8 +69,9 @@ La configuración de audio (driver, dispositivos, canal, retraso y frecuencia de
 
 | Problema | Solución |
 |---|---|
-| "No se pudo abrir el audio" | Cerrá otros programas que estén usando la placa (DAWs, FL Studio, etc.) |
-| Se escuchan cortes o chasquidos | En ⚙ Configuración de audio, cambiá **Retraso** a *Bajo* o *Seguro* |
+| "No se pudo abrir la placa de audio" | El programa ya probó solo otras frecuencias y drivers. El mensaje muestra qué programas abiertos pueden estar usando la placa: cerralos. Si no aparece ninguno, desenchufá y volvé a enchufar la placa y abrí de nuevo la Pedalera |
+| El sonido sale entrecortado o "trabado" | Instalá el driver ASIO de la placa y elegí **ASIO** en ⚙ Configuración de audio. En notebooks, enchufá el cargador y conectá la placa directo a un puerto USB (sin hub). Si hay cortes, el programa sube el **Retraso** solo y avisa en amarillo |
+| Se escuchan chasquidos sueltos | En ⚙ Configuración de audio, cambiá **Retraso** a *Bajo* o *Seguro* y dejá la **Frecuencia** en *Auto* |
 | Se nota el retraso al tocar | Usá el driver **ASIO** y probá **Retraso** en *Mínimo* |
 | Zumbido entre nota y nota | Subí la **Sensibilidad** del Noise Gate |
 | La guitarra suena en un solo oído | Dejá el pedal Auriculares en **Mono** y revisá el monitoreo directo de la placa |
